@@ -212,8 +212,8 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
                     num_warps=4,
                 )
                 if can_direct_gemm:
-                    grad_slice = grad[:, start:stop].view(rows, hidden_dim)
-                    torch.matmul(logits_2d, w_compute, out=grad_slice)
+                    grad_2d = torch.matmul(logits_2d, w_compute)
+                    grad[:, start:stop] = grad_2d.view(bsz, cur_len, hidden_dim)
                 else:
                     piece_req = piece.detach().requires_grad_(True)
                     with torch.enable_grad():
