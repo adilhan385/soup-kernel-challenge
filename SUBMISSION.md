@@ -2,8 +2,8 @@
 
 ## Team & Repository Links
 
-- **Repository URL:** `https://github.com/<your-username>/<your-team-repo>`
-- **Final Commit SHA:** `<paste-final-40-char-commit-sha-here>`
+- **Repository URL:** `https://github.com/BAITC-Hacks/hack-66237e75-doublegumble` (или `https://github.com/adilhan385/soup-kernel-challenge`)
+- **Final Commit SHA:** `432b19a`
 - **Public Kaggle Notebook (Saved Version with "Run All" output):** `https://www.kaggle.com/code/<your-kaggle-username>/soup-kernel-challenge-t4`
 - **Demo Video (up to 3 min):** `<paste-video-link-here>`
 - **Presentation:** `<paste-presentation-link-here>`
