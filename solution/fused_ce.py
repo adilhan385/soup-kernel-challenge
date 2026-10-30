@@ -152,7 +152,7 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
             w_compute = head_weight
 
         block_v_fwd = 2048
-        block_v_bwd = 1024
+        block_v_bwd = 2048
 
         for start in range(0, seq_len, chunk):
             stop = min(start + chunk, seq_len)
@@ -209,7 +209,7 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
                     vocab_size,
                     int(ignore_index),
                     BLOCK_V=block_v_bwd,
-                    num_warps=4,
+                    num_warps=8,
                 )
                 if can_direct_gemm:
                     grad_2d = torch.matmul(logits_2d, w_compute)

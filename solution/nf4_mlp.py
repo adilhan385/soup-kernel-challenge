@@ -185,16 +185,11 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         dequantize_nf4_triton(w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
         dequantize_nf4_triton(w_down, dtype=compute_dtype, out=w_d)
 
-        out_2d = torch.empty((rows, hidden_dim), dtype=compute_dtype, device=x.device)
-        chunk_rows = 512
-
-        for s in range(0, rows, chunk_rows):
-            e = min(s + chunk_rows, rows)
-            gu = torch.matmul(x_2d[s:e], w_gu.t())
-            g = gu[:, :inter_dim]
-            u = gu[:, inter_dim:]
-            h = F.silu(g) * u
-            torch.matmul(h, w_d.t(), out=out_2d[s:e])
+        gu = torch.matmul(x_2d, w_gu.t())
+        g = gu[:, :inter_dim]
+        u = gu[:, inter_dim:]
+        h = F.silu(g) * u
+        out_2d = torch.matmul(h, w_d.t())
 
         ctx.save_for_backward(x_comp)
         ctx.w_gate = w_gate
@@ -225,25 +220,20 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         dequantize_nf4_triton(ctx.w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
         dequantize_nf4_triton(ctx.w_down, dtype=compute_dtype, out=w_d)
 
-        dx_2d = torch.empty((rows, hidden_dim), dtype=compute_dtype, device=x_comp.device)
-        chunk_rows = 512
+        gu = torch.matmul(x_2d, w_gu.t())
+        dh = torch.matmul(dy_2d, w_d)
 
-        for s in range(0, rows, chunk_rows):
-            e = min(s + chunk_rows, rows)
-            gu = torch.matmul(x_2d[s:e], w_gu.t())
-            dh = torch.matmul(dy_2d[s:e], w_d)
+        g_f = gu[:, :inter_dim].float()
+        u = gu[:, inter_dim:]
+        sig = torch.sigmoid(g_f)
+        silu_g = (g_f * sig).to(compute_dtype)
+        grad_silu = (sig * (1.0 + g_f * (1.0 - sig))).to(compute_dtype)
 
-            g_f = gu[:, :inter_dim].float()
-            u = gu[:, inter_dim:]
-            sig = torch.sigmoid(g_f)
-            silu_g = (g_f * sig).to(compute_dtype)
-            grad_silu = (sig * (1.0 + g_f * (1.0 - sig))).to(compute_dtype)
-
-            dg = dh * u * grad_silu
-            du = dh * silu_g
-            gu[:, :inter_dim] = dg
-            gu[:, inter_dim:] = du
-            torch.matmul(gu, w_gu, out=dx_2d[s:e])
+        dg = dh * u * grad_silu
+        du = dh * silu_g
+        gu[:, :inter_dim] = dg
+        gu[:, inter_dim:] = du
+        dx_2d = torch.matmul(gu, w_gu)
 
         dx = dx_2d.view(orig_shape)
         if dx.dtype != ctx.input_dtype:
