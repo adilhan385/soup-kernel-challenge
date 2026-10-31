@@ -247,7 +247,7 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         save_gu = (
             torch.is_grad_enabled()
             and x.requires_grad
-            and ((not x.is_cuda) or (torch.cuda.memory_allocated(x.device) < 2600 * 1024 * 1024))
+            and ((not x.is_cuda) or (torch.cuda.memory_allocated(x.device) < 3000 * 1024 * 1024))
         )
         if save_gu:
             h = F.silu(gu[:, :inter_dim]) * gu[:, inter_dim:]
@@ -291,32 +291,76 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         w_gu = get_shared_scratch(saved.device, compute_dtype, 0, (2 * inter_dim, hidden_dim))
         w_d = get_shared_scratch(saved.device, compute_dtype, 1, (hidden_dim, inter_dim))
 
-        dequantize_nf4_triton(ctx.w_gate, dtype=compute_dtype, out=w_gu[:inter_dim])
-        dequantize_nf4_triton(ctx.w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
         dequantize_nf4_triton(ctx.w_down, dtype=compute_dtype, out=w_d)
 
         if ctx.saved_gu:
             gu = saved
+            dh = torch.matmul(dy_2d, w_d)
+            if rows <= 1024:
+                g = gu[:, :inter_dim].float()
+                u = gu[:, inter_dim:].float()
+                dh_f = dh.float()
+                sig = torch.sigmoid(g)
+                silu_g = g * sig
+                du = (dh_f * silu_g).to(compute_dtype)
+                dg = (dh_f * u * (sig + silu_g * (1.0 - sig))).to(compute_dtype)
+                del dh, dh_f, g, u, sig, silu_g, saved
+                dgu = torch.cat([dg, du], dim=-1)
+                del dg, du
+            else:
+                step = 1024
+                for s in range(0, rows, step):
+                    e = min(s + step, rows)
+                    g_s = gu[s:e, :inter_dim].float()
+                    u_s = gu[s:e, inter_dim:].float()
+                    dh_s = dh[s:e].float()
+                    sig = torch.sigmoid(g_s)
+                    silu_g = g_s * sig
+                    du_s = dh_s * silu_g
+                    dg_s = dh_s * u_s * (sig + silu_g * (1.0 - sig))
+                    gu[s:e, :inter_dim] = dg_s.to(compute_dtype)
+                    gu[s:e, inter_dim:] = du_s.to(compute_dtype)
+                del dh
+                dgu = gu
+
+            dequantize_nf4_triton(ctx.w_gate, dtype=compute_dtype, out=w_gu[:inter_dim])
+            dequantize_nf4_triton(ctx.w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
+            dx_2d = torch.matmul(dgu, w_gu)
+            del dgu
         else:
             x_2d = saved.view(rows, hidden_dim)
+            dequantize_nf4_triton(ctx.w_gate, dtype=compute_dtype, out=w_gu[:inter_dim])
+            dequantize_nf4_triton(ctx.w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
             gu = torch.matmul(x_2d, w_gu.t())
-        dh = torch.matmul(dy_2d, w_d)
-
-        step = 1024
-        for s in range(0, rows, step):
-            e = min(s + step, rows)
-            g_s = gu[s:e, :inter_dim].float()
-            u_s = gu[s:e, inter_dim:].float()
-            dh_s = dh[s:e].float()
-            sig = torch.sigmoid(g_s)
-            silu_g = g_s * sig
-            du_s = dh_s * silu_g
-            dg_s = dh_s * u_s * (sig + silu_g * (1.0 - sig))
-            gu[s:e, :inter_dim] = dg_s.to(compute_dtype)
-            gu[s:e, inter_dim:] = du_s.to(compute_dtype)
-        del dh
-        dx_2d = torch.matmul(gu, w_gu)
-        del gu
+            dh = torch.matmul(dy_2d, w_d)
+            if rows <= 1024:
+                g = gu[:, :inter_dim].float()
+                u = gu[:, inter_dim:].float()
+                dh_f = dh.float()
+                sig = torch.sigmoid(g)
+                silu_g = g * sig
+                du = (dh_f * silu_g).to(compute_dtype)
+                dg = (dh_f * u * (sig + silu_g * (1.0 - sig))).to(compute_dtype)
+                del dh, dh_f, g, u, sig, silu_g, gu
+                dgu = torch.cat([dg, du], dim=-1)
+                del dg, du
+            else:
+                step = 1024
+                for s in range(0, rows, step):
+                    e = min(s + step, rows)
+                    g_s = gu[s:e, :inter_dim].float()
+                    u_s = gu[s:e, inter_dim:].float()
+                    dh_s = dh[s:e].float()
+                    sig = torch.sigmoid(g_s)
+                    silu_g = g_s * sig
+                    du_s = dh_s * silu_g
+                    dg_s = dh_s * u_s * (sig + silu_g * (1.0 - sig))
+                    gu[s:e, :inter_dim] = dg_s.to(compute_dtype)
+                    gu[s:e, inter_dim:] = du_s.to(compute_dtype)
+                del dh
+                dgu = gu
+            dx_2d = torch.matmul(dgu, w_gu)
+            del dgu
 
         dx = dx_2d.view(orig_shape)
         if dx.dtype != ctx.input_dtype:
