@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Soup Kernel Challenge — Decentrathon 6.0</title>
+<style>
+  @page {
+    size: 297mm 210mm; /* A4 landscape */
+    margin: 0;
+  }
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  }
+  body {
+    background: #0f172a;
+    color: #0f172a;
+  }
+  .slide {
+    width: 297mm;
+    height: 210mm;
+    page-break-after: always;
+    background: #ffffff;
+    padding: 16mm 20mm;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    position: relative;
+    overflow: hidden;
+  }
+  .header {
+    border-bottom: 2px solid #e2e8f0;
+    padding-bottom: 6mm;
+  }
+  .title {
+    font-size: 24pt;
+    font-weight: 800;
+    color: #0f172a;
+    line-height: 1.15;
+  }
+  .subtitle {
+    font-size: 13pt;
+    font-weight: 600;
+    color: #2563eb;
+    margin-top: 2.5mm;
+  }
+  .content {
+    flex: 1;
+    display: grid;
+    gap: 6mm;
+    margin-top: 6mm;
+  }
+  .grid-3 {
+    grid-template-columns: 1fr 1fr 1fr;
+  }
+  .grid-2 {
+    grid-template-columns: 1fr 1fr;
+  }
+  .card {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 5mm 6mm;
+    display: flex;
+    flex-direction: column;
+  }
+  .card-title {
+    font-size: 13pt;
+    font-weight: 700;
+    color: #0f172a;
+    margin-bottom: 3.5mm;
+    border-bottom: 1.5px solid #cbd5e1;
+    padding-bottom: 2mm;
+  }
+  .card-title.blue { color: #2563eb; }
+  .card-title.green { color: #16a34a; }
+  ul {
+    list-style: none;
+  }
+  li {
+    font-size: 10.5pt;
+    line-height: 1.45;
+    color: #334155;
+    margin-bottom: 3mm;
+    position: relative;
+    padding-left: 5mm;
+  }
+  li::before {
+    content: "•";
+    color: #2563eb;
+    font-weight: bold;
+    position: absolute;
+    left: 0;
+  }
+  .stat-card {
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 4.5mm;
+    text-align: center;
+  }
+  .stat-label {
+    font-size: 9.5pt;
+    font-weight: 600;
+    color: #64748b;
+    text-transform: uppercase;
+  }
+  .stat-value {
+    font-size: 16pt;
+    font-weight: 800;
+    color: #0f172a;
+    margin: 2mm 0;
+  }
+  .stat-badge {
+    font-size: 9.5pt;
+    font-weight: 700;
+    color: #16a34a;
+  }
+  .rule-item {
+    font-size: 10pt;
+    line-height: 1.4;
+    color: #1e293b;
+    margin-bottom: 2mm;
+  }
+  .rule-item strong {
+    color: #16a34a;
+  }
+  .footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-top: 1px solid #e2e8f0;
+    padding-top: 3.5mm;
+    font-size: 9pt;
+    color: #94a3b8;
+  }
+</style>
+</head>
+<body>
+
+<!-- SLIDE 1 -->
+<div class="slide">
+  <div class="header">
+    <div class="title">Soup Kernel Challenge: Оптимизация Qwen2.5 LoRA на Kaggle T4</div>
+    <div class="subtitle">Decentrathon 6.0 | Слайд 1: Задача и профилирование узких мест</div>
+  </div>
+  <div class="content grid-3">
+    <div class="card">
+      <div class="card-title">Аппаратный контекст</div>
+      <ul>
+        <li><strong>GPU:</strong> Бесплатная Kaggle Tesla T4 (15 ГБ VRAM, архитектура Turing sm_75 без поддержки bfloat16).</li>
+        <li><strong>Модель:</strong> Qwen2.5-1.5B в 4-битном формате NF4 (библиотека bitsandbytes).</li>
+        <li><strong>Задача:</strong> Обучение LoRA (r=16 на q_proj, v_proj), батч 4, seq_len 512, 64 шага, fp16.</li>
+        <li><strong>Проблема:</strong> На T4 обучение упирается в потолок VRAM — невозможно увеличить батч или длину контекста.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title">Проблема базового Soup</div>
+      <ul>
+        <li><strong>Время обучения:</strong> 84.6 с на стандартной сессии Kaggle.</li>
+        <li><strong>Пиковая память:</strong> 14 345 МиБ из 15 ГБ (~95% доступной VRAM) — критическая близость к OOM.</li>
+        <li><strong>Запас оптимизации:</strong> Unsloth на аналогичной LoRA занимает около 2.3 ГБ (в 6 раз меньше).</li>
+        <li><strong>Цель хакатона:</strong> Ускорить обучение и радикально снизить память собственными Triton-кернелами.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title">Профиль узких мест (Soup)</div>
+      <ul>
+        <li><strong>44% времени:</strong> мелкие поэлементные операции и касты FP32↔FP16 из-за перевода весов в FP32 в PEFT на sm&lt;80.</li>
+        <li><strong>7% времени и ~1.2 ГБ:</strong> полный тензор логитов по словарю 152k ради подсчёта энтропии.</li>
+        <li><strong>Лишние активации:</strong> MatMul4Bit и Qwen2MLP сохраняют входы и тензоры [B·S, 8960] на всех 28 слоях.</li>
+        <li><strong>Холостой ход:</strong> вычисление внимания на pad-токенах разной длины внутри батча.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer">
+    <span>Soup Kernel Challenge (Decentrathon 6.0)</span>
+    <span>Команда: lolkek4ik | Репозиторий: github.com/adilhan385/soup-kernel-challenge</span>
+    <span>Слайд 1 из 4</span>
+  </div>
+</div>
+
+<!-- SLIDE 2 -->
+<div class="slide">
+  <div class="header">
+    <div class="title">Архитектура решения: 7 Triton-кернелов и обвязка</div>
+    <div class="subtitle">Decentrathon 6.0 | Слайд 2: Что перенесли в Triton и как устроен пайплайн</div>
+  </div>
+  <div class="content grid-2">
+    <div class="card">
+      <div class="card-title blue">7 собственных @triton.jit кернелов (10.6% времени)</div>
+      <ul>
+        <li><strong>qwen2_online_ce_entropy_fwd/bwd_kernel (fused_ce.py):</strong> онлайн log-sum-exp, loss по целевому токену, точная энтропия и accuracy тайлами по 2048. Полный тензор логитов 152k не материализуется! Градиент пишется in-place.</li>
+        <li><strong>qwen2_nf4_dequant_kernel (nf4_mlp.py):</strong> векторная распаковка 4-битных весов в fp16 с честным double quantization в переиспользуемые scratch-буферы.</li>
+        <li><strong>qwen2_rmsnorm_fwd/bwd_kernel (rmsnorm.py):</strong> дисперсия в fp32, вывод в fp16 за один проход по строке. В backward сохраняется только rstd.</li>
+        <li><strong>qwen2_rope_fwd/bwd_kernel (rope.py):</strong> страйдовый поворот Q и K голов одним запуском без промежуточных срезов и копий памяти.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title blue">Оптимизации autograd и пайплайна</div>
+      <ul>
+        <li><strong>Чанкование Cross-Entropy по 256 строк:</strong> через ChunkedHeadLoss со статическим fp16-буфером 74 МБ вместо 1.2 ГБ. Градиент dX считается сразу в forward.</li>
+        <li><strong>Within-batch Unpadding (varlen):</strong> удаление pad-токенов перед attention со склейкой в [1, ΣLᵢ]. Токены и порядок не меняются (rewind.jsonl идентичен базе).</li>
+        <li><strong>Компактный MLP:</strong> сохранение gu = x·W_gate_upᵀ для всех 28 слоев устраняет повторный тяжелый GEMM в backward, а silu_backward считается in-place.</li>
+        <li><strong>Единый FP16 residual-поток:</strong> замороженные веса оставлены в fp16, обучаемые LoRA — в fp32. Устранены паразитные касты.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer">
+    <span>Soup Kernel Challenge (Decentrathon 6.0)</span>
+    <span>Команда: lolkek4ik | Репозиторий: github.com/adilhan385/soup-kernel-challenge</span>
+    <span>Слайд 2 из 4</span>
+  </div>
+</div>
+
+<!-- SLIDE 3 -->
+<div class="slide">
+  <div class="header">
+    <div class="title">Результаты бенчмарка: замер в Kaggle-ноутбуке</div>
+    <div class="subtitle">Decentrathon 6.0 | Слайд 3: Сравнение метрик и проверки по регламенту</div>
+  </div>
+  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 5mm; margin-top: 5mm;">
+    <div class="stat-card">
+      <div class="stat-label">Время soup train</div>
+      <div class="stat-value">84.6 с ➔ 62.5 с</div>
+      <div class="stat-badge">Ускорение 1.352x (на 35.2% быстрее)</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Пик памяти GPU</div>
+      <div class="stat-value">14 345 ➔ 2 759 MiB</div>
+      <div class="stat-badge">В 5.199 раза меньше памяти</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Качество (Eval Loss)</div>
+      <div class="stat-value">2.04968 ➔ 2.04976</div>
+      <div class="stat-badge">+0.004% дельта (лимит &le; 0.5%)</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Доля Triton-кернелов</div>
+      <div class="stat-value">10.6% времени</div>
+      <div class="stat-badge">Порог &ge; 5.0% выполнен</div>
+    </div>
+  </div>
+  <div class="card" style="margin-top: 5mm;">
+    <div class="card-title green">Проверки регламента: check_rules.py (ALL CHECKS PASSED — 10 из 10)</div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 3mm;">
+      <div>
+        <div class="rule-item"><strong>✓ 1.</strong> Базовый и оптимизированный прогоны завершены.</div>
+        <div class="rule-item"><strong>✓ 2.</strong> Сторонние библиотеки отсутствуют: loaded: none, imported: none.</div>
+        <div class="rule-item"><strong>✓ 3.</strong> Все 7 собственных @triton.jit кернелов работают в обучении.</div>
+        <div class="rule-item"><strong>✓ 4.</strong> Доля кернелов: 10.6% от времени шагов 3+ (двукратный запас).</div>
+        <div class="rule-item"><strong>✓ 5.</strong> Результаты, токены, шаги и rewind.jsonl строго идентичны.</div>
+      </div>
+      <div>
+        <div class="rule-item"><strong>✓ 6.</strong> Кривая loss повторяет базу (первый шаг 0.03%, среднее 0.29%).</div>
+        <div class="rule-item"><strong>✓ 7.</strong> Качество сохранено: eval loss +0.004% при допустимых +0.5%.</div>
+        <div class="rule-item"><strong>✓ 8.</strong> Не хуже базы: time x0.740, memory x0.192.</div>
+        <div class="rule-item"><strong>✓ 9.</strong> Чистый замер на свободной Tesla T4 с аллокатором harness.</div>
+        <div class="rule-item"><strong>✓ 10.</strong> Регрессионные тесты Soup: 79 passed. Юнит-тесты: 5 passed.</div>
+      </div>
+    </div>
+  </div>
+  <div class="footer">
+    <span>Soup Kernel Challenge (Decentrathon 6.0)</span>
+    <span>Команда: lolkek4ik | Репозиторий: github.com/adilhan385/soup-kernel-challenge</span>
+    <span>Слайд 3 из 4</span>
+  </div>
+</div>
+
+<!-- SLIDE 4 -->
+<div class="slide">
+  <div class="header">
+    <div class="title">Честный анализ ограничений и перспективы развития</div>
+    <div class="subtitle">Decentrathon 6.0 | Слайд 4: Архитектурные компромиссы и точки роста</div>
+  </div>
+  <div class="content grid-2">
+    <div class="card">
+      <div class="card-title">Честные архитектурные компромиссы</div>
+      <ul>
+        <li><strong>Не писали собственный GEMM на Triton:</strong> cuBLAS от NVIDIA на Tensor Cores Turing уже оптимизирован до предела. Писать тривиальный matmul на Triton ради формального времени не имело смысла.</li>
+        <li><strong>Без системного Gradient Checkpointing:</strong> Soup поддерживает готовый флаг gradient_checkpointing, но мы оптимизировали память без него — за счёт управления временем жизни буферов и сброса промежуточных активаций.</li>
+        <li><strong>Шум облачной среды Kaggle:</strong> Время базы между сессиями колеблется от 79 до 90 с из-за фоновой нагрузки облака. Однако относительное ускорение стабильно держится на уровне ~1.35x, а экономия памяти — строго 5.2x.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title blue">Дальнейшие шаги (Next Steps)</div>
+      <ul>
+        <li><strong>1. Fused Dequant-GEMM в регистрах Triton:</strong> объединение распаковки 4-битных весов прямо в тайлы GEMM. Это полностью устранит запись fp16-весов в глобальную память VRAM.</li>
+        <li><strong>2. Кастомный Varlen Attention кернел:</strong> замена цикла по последовательностям поверх PyTorch SDPA на единый оптимизированный FlashAttention-кернел с поддержкой cu_seqlens.</li>
+        <li><strong>3. Fused Residual + RMSNorm:</strong> слияние операции сложения остаточных связей (x + residual) и вычисления среднеквадратичной нормализации в единый проход по памяти.</li>
+        <li><strong>4. Оценка на новых GPU и bfloat16:</strong> тестирование решения на архитектурах Ada Lovelace (RTX 4090, L4) и Hopper (H100) с нативным bfloat16.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer">
+    <span>Soup Kernel Challenge (Decentrathon 6.0)</span>
+    <span>Команда: lolkek4ik | Репозиторий: github.com/adilhan385/soup-kernel-challenge</span>
+    <span>Слайд 4 из 4</span>
+  </div>
+</div>
+
+</body>
+</html>

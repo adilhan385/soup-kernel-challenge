@@ -5,7 +5,7 @@
 - **Measured solution code:** `2be96d7`
 - **Public Kaggle notebook (Save & Run All):** https://www.kaggle.com/code/lolkek4ik/notebook90b0a93b32
 - **Demo video script / structure:** [VIDEO_SCRIPT.md](VIDEO_SCRIPT.md) (запись видео по сценарию)
-- **Presentation (4 slides):** [PRESENTATION.md](PRESENTATION.md)
+- **Presentation (4 slides):** [presentation.pdf](presentation.pdf) | [presentation.pptx](presentation.pptx) | [PRESENTATION.md](PRESENTATION.md)
 
 ## Measured results (Kaggle Tesla T4, `python harness/run_task.py`, 1 repeat)
 
