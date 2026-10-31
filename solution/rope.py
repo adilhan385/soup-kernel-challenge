@@ -374,10 +374,10 @@ def patch_qwen2_rope():
                         is_causal=True,
                         scale=scale,
                         **kwargs,
-                    ).transpose(1, 2)
+                    )
                     for s, e in seq_bounds
                 ]
-                return torch.cat(outs, dim=1).transpose(1, 2)
+                return torch.cat(outs, dim=2)
             return orig_sdpa(
                 query,
                 key,
