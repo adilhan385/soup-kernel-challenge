@@ -168,8 +168,8 @@ class FusedQwen2RoPEFn(torch.autograd.Function):
 
         cos_3d, sin_3d, stride_cb, stride_cs = _normalize_cos_sin(cos, sin, bsz, seq_len, dim)
 
-        qo = torch.empty_like(q)
-        ko = torch.empty_like(k)
+        qo = torch.empty((bsz, n_qh, seq_len, dim), dtype=q.dtype, device=q.device)
+        ko = torch.empty((bsz, n_kh, seq_len, dim), dtype=k.dtype, device=k.device)
 
         grid = (bsz * seq_len, n_qh + n_kh)
         qwen2_rope_fwd_kernel[grid](
@@ -214,8 +214,8 @@ class FusedQwen2RoPEFn(torch.autograd.Function):
         if dko.stride(-1) != 1:
             dko = dko.contiguous()
 
-        dq = torch.empty_like(dqo)
-        dk = torch.empty_like(dko)
+        dq = torch.empty((bsz, n_qh, seq_len, half_d * 2), dtype=dqo.dtype, device=dqo.device)
+        dk = torch.empty((bsz, n_kh, seq_len, half_d * 2), dtype=dko.dtype, device=dko.device)
 
         grid = (bsz * seq_len, n_qh + n_kh)
         qwen2_rope_bwd_kernel[grid](
@@ -314,15 +314,22 @@ class _ScatterUnpaddedFn(torch.autograd.Function):
 
 
 def fast_repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads while keeping physical memory in [B, S, H, D] order so sequence slices [:, :, s:e, :] are dense."""
+    """Repeat KV heads while preserving contiguous memory layout."""
     if n_rep == 1:
-        return hidden_states
+        return hidden_states.contiguous()
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if hidden_states.is_contiguous():
+        return (
+            hidden_states[:, :, None, :, :]
+            .expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+            .reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+        )
     return (
         hidden_states.transpose(1, 2)[:, :, :, None, :]
         .expand(batch, slen, num_key_value_heads, n_rep, head_dim)
         .reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
         .transpose(1, 2)
+        .contiguous()
     )
 
 
@@ -332,7 +339,7 @@ def patch_qwen2_rope():
     modeling_qwen2.apply_rotary_pos_emb = fused_apply_rotary_pos_emb
     modeling_qwen2.repeat_kv = fast_repeat_kv
 
-    # 1. Per-sequence causal SDPA when within-batch unpadding is active
+    # 1. Per-sequence causal SDPA when within-batch unpadding is active, or hardware-accelerated Cutlass Causal FMHA
     if not getattr(F.scaled_dot_product_attention, "_soup_solution_patched", False):
         orig_sdpa = F.scaled_dot_product_attention
 
@@ -346,6 +353,18 @@ def patch_qwen2_rope():
             scale=None,
             **kwargs,
         ):
+            # For 4D causal masks from HF right-padded sequences, bypass mask to use Cutlass Causal FMHA directly
+            if query.is_cuda and (is_causal or (attn_mask is not None and attn_mask.dim() == 4)):
+                return orig_sdpa(
+                    query,
+                    key,
+                    value,
+                    attn_mask=None,
+                    dropout_p=dropout_p,
+                    is_causal=True,
+                    scale=scale,
+                    **kwargs,
+                )
             bounds_info = _UNPAD_STATE.bounds
             if (
                 bounds_info is not None

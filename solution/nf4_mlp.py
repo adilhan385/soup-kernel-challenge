@@ -77,6 +77,25 @@ def clear_weight_scratch():
     _SCRATCH_POOL.clear()
 
 
+def get_dequantized_weight(
+    weight, dtype: torch.dtype, cache: bool = False, slot: int = 0
+) -> torch.Tensor:
+    """Retrieve dequantized weight either from a per-weight cache or from a shared scratch slot."""
+    if cache:
+        cached = getattr(weight, "_soup_cached_fp16", None)
+        if cached is not None and cached.dtype == dtype and cached.device == weight.device:
+            return cached
+        w_shape = tuple(weight.quant_state.shape)
+        w_fp16 = torch.empty(w_shape, dtype=dtype, device=weight.device)
+        dequantize_nf4_triton(weight, dtype=dtype, out=w_fp16)
+        weight._soup_cached_fp16 = w_fp16
+        return w_fp16
+    w_shape = tuple(weight.quant_state.shape)
+    w_buf = get_shared_scratch(weight.device, dtype, slot, w_shape)
+    dequantize_nf4_triton(weight, dtype=dtype, out=w_buf)
+    return w_buf
+
+
 def dequantize_nf4_triton(
     weight, dtype: torch.dtype = torch.float16, out: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -184,9 +203,7 @@ class TritonLinear4bitFn(torch.autograd.Function):
         compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float16
         x_comp = x if x.dtype == compute_dtype else x.to(compute_dtype)
 
-        w_shape = tuple(weight.quant_state.shape)
-        w_buf = get_shared_scratch(x.device, compute_dtype, 0, w_shape)
-        dequantize_nf4_triton(weight, dtype=compute_dtype, out=w_buf)
+        w_buf = get_dequantized_weight(weight, compute_dtype, cache=True)
 
         out = torch.matmul(x_comp, w_buf.t())
         if bias is not None:
@@ -203,10 +220,7 @@ class TritonLinear4bitFn(torch.autograd.Function):
         compute_dtype = ctx.compute_dtype
         dy = grad_output if grad_output.dtype == compute_dtype else grad_output.to(compute_dtype)
 
-        weight = ctx.weight
-        w_shape = tuple(weight.quant_state.shape)
-        w_buf = get_shared_scratch(dy.device, compute_dtype, 0, w_shape)
-        dequantize_nf4_triton(weight, dtype=compute_dtype, out=w_buf)
+        w_buf = get_dequantized_weight(ctx.weight, compute_dtype, cache=True)
 
         grad_x = torch.matmul(dy, w_buf)
         if grad_x.dtype != ctx.input_dtype:
@@ -243,10 +257,8 @@ class TritonLoRALinear4bitFn(torch.autograd.Function):
         rows = x_comp.numel() // in_dim
         x_2d = x_comp.view(rows, in_dim)
 
-        w_shape = tuple(weight.quant_state.shape)
-        out_dim = w_shape[0]
-        w_buf = get_shared_scratch(x.device, compute_dtype, 0, w_shape)
-        dequantize_nf4_triton(weight, dtype=compute_dtype, out=w_buf)
+        w_buf = get_dequantized_weight(weight, compute_dtype, cache=True)
+        out_dim = w_buf.shape[0]
 
         out_2d = torch.matmul(x_2d, w_buf.t())
         if bias is not None:
@@ -316,10 +328,7 @@ class TritonLoRALinear4bitFn(torch.autograd.Function):
 
         grad_x = None
         if ctx.needs_input_grad[0]:
-            weight = ctx.weight
-            w_shape = tuple(weight.quant_state.shape)
-            w_buf = get_shared_scratch(dy_2d.device, compute_dtype, 0, w_shape)
-            dequantize_nf4_triton(weight, dtype=compute_dtype, out=w_buf)
+            w_buf = get_dequantized_weight(ctx.weight, compute_dtype, cache=True)
             grad_x_2d = torch.matmul(dy_2d, w_buf)
             grad_x_2d.addmm_(dxa_2d, a_comp)
             grad_x = grad_x_2d.view(ctx.orig_shape)
@@ -362,7 +371,7 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         save_gu = (
             torch.is_grad_enabled()
             and x.requires_grad
-            and ((not x.is_cuda) or (torch.cuda.memory_allocated(x.device) < 2400 * 1024 * 1024))
+            and ((not x.is_cuda) or (torch.cuda.memory_allocated(x.device) < 2550 * 1024 * 1024))
         )
         if save_gu:
             h = F.silu(gu[:, :inter_dim])
