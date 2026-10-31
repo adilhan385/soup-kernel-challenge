@@ -1,9 +1,9 @@
 # Soup Kernel Challenge — решение (Decentrathon 6.0)
 
 **Кратко.** Ускоряем `soup train` (Soup 0.77.0, Qwen2.5-1.5B-Instruct в 4-bit NF4, LoRA r=16 на `q_proj`/`v_proj`, batch 4, длина 512, 64 шага, fp16, Kaggle Tesla T4). В `solution/` семь собственных `@triton.jit`-кернелов: распаковка NF4, онлайн cross-entropy (прямой и обратный проход), RMSNorm (прямой/обратный), RoPE (прямой/обратный). Вокруг них собственные autograd-функции, которые не хранят лишние активации, и удаление pad-токенов внутри батча.
-Последний полный замер на Kaggle T4: **speedup 1.355x**, **время 58.4 s**, **пиковая память в 5.199 раза ниже базы** (2759 MiB против 14345 MiB), eval loss **+0.007 %** к базе, пройдены **все 10 проверок** `check_rules.py`. Замер один (`--repeats 1`).
+Последний полный замер на Kaggle T4: **speedup 1.352x**, **время 62.5 s** (база 84.6 s), **пиковая память в 5.199 раза ниже базы** (2759 MiB против 14345 MiB), eval loss **+0.004 %** к базе, пройдены **все 10 проверок** `check_rules.py`. Замер один (`--repeats 1`).
 
-**English summary.** We speed up `soup train` on a Kaggle T4 for the fixed task (Qwen2.5-1.5B NF4 + LoRA r=16 on q/v, batch 4, seq 512, 64 steps). The solution has 7 hand-written Triton kernels: NF4 dequantization, online cross-entropy with entropy and accuracy (fwd/bwd), RMSNorm (fwd/bwd) and RoPE (fwd/bwd). Around them are custom autograd functions that drop activations nobody needs, plus within-batch unpadding. Last full run (1 repeat): 79.1 s → 58.4 s (**1.355x**), 14345 → 2759 MiB peak (**5.199x**), eval loss +0.007 %, all 10 rule checks passed. Kernel code is our own. FlashAttention, Liger-Kernel and Unsloth are cited only as sources of ideas; no code was copied from them.
+**English summary.** We speed up `soup train` on a Kaggle T4 for the fixed task (Qwen2.5-1.5B NF4 + LoRA r=16 on q/v, batch 4, seq 512, 64 steps). The solution has 7 hand-written Triton kernels: NF4 dequantization, online cross-entropy with entropy and accuracy (fwd/bwd), RMSNorm (fwd/bwd) and RoPE (fwd/bwd). Around them are custom autograd functions that drop activations nobody needs, plus within-batch unpadding. Last full run (1 repeat): 84.6 s → 62.5 s (**1.352x**), 14345 → 2759 MiB peak (**5.199x**), eval loss +0.004 %, all 10 rule checks passed. Kernel code is our own. FlashAttention, Liger-Kernel and Unsloth are cited only as sources of ideas; no code was copied from them.
 
 ---
 
@@ -69,7 +69,7 @@
 
 **Публичный ноутбук:** https://www.kaggle.com/code/lolkek4ik/notebook90b0a93b32  
 **Репозиторий:** https://github.com/adilhan385/soup-kernel-challenge  
-**Финальный коммит решения:** `26512f3` (ветка `main`).
+**Финальный коммит решения:** `2be96d7` (ветка `main`).
 
 ### Kaggle (так же запускает жюри)
 
@@ -80,7 +80,7 @@
    REPO_URL = "https://github.com/adilhan385/soup-kernel-challenge.git"
    COMMIT = "26512f3"   # или оставить пустым "" для последнего main
    ```
-4. **Run All**. Полный прогон занимает около 10 минут (только шаг `run_task.py` в нашем запуске: warm-up + база 79.1 s + решение 58.4 s + оценка обоих адаптеров).
+4. **Run All**. Полный прогон занимает около 10 минут (только шаг `run_task.py` в нашем запуске: warm-up + база 84.6 s + решение 62.5 s + оценка обоих адаптеров).
 
 Ноутбук ставит такие версии:
 ```
@@ -108,13 +108,13 @@ python harness/run_task.py --only solution --out runs_try --profile
 
 ## 3. Результаты и ограничения
 
-### 3.1 Последний полный замер (коммит `26512f3`, Kaggle T4, `--repeats 1`)
+### 3.1 Последний полный замер (публичный ноутбук `notebook90b0a93b32`, Kaggle T4, `--repeats 1`)
 
 | | База (Soup 0.77.0) | Решение | Отношение |
 |---|---:|---:|---:|
-| Время `soup train` целиком | 79.1 s | 58.4 s | **speedup 1.355x** |
+| Время `soup train` целиком | 84.6 s | 62.5 s | **speedup 1.352x** |
 | Пик памяти GPU (nvidia-smi) | 14345 MiB | 2759 MiB | **memory 5.199x** |
-| Eval loss (`eval_adapter.py`) | 2.04966 | 2.04980 | **+0.007 %** |
+| Eval loss (`eval_adapter.py`) | 2.04968 | 2.04976 | **+0.004 %** |
 | Доля наших кернелов | — | 10.6 % | порог ≥ 5 % |
 
 `check_rules.py`, **ALL CHECKS PASSED**:
@@ -127,8 +127,8 @@ python harness/run_task.py --only solution --out runs_try --profile
 | 4 | доля своих кернелов ≥ 5 % | PASS, 10.6 % |
 | 5 | те же задача и выходы Soup | PASS, identical within tolerance |
 | 6 | кривая loss повторяет базу | PASS, первый шаг 0.03 %, среднее 0.29 % (лимиты 1 % и 3 %) |
-| 7 | eval loss не выше базы больше чем на 0.5 % | PASS, +0.007 % |
-| 8 | не хуже базы по времени и памяти | PASS, time x0.738, memory x0.192 |
+| 7 | eval loss не выше базы больше чем на 0.5 % | PASS, +0.004 % |
+| 8 | не хуже базы по времени и памяти | PASS, time x0.740, memory x0.192 |
 | 9 | чистый замер | PASS, clean |
 | 10 | регрессионные тесты Soup с нашими патчами | PASS, 79 passed, 14 warnings |
 
@@ -142,6 +142,7 @@ python harness/run_task.py --only solution --out runs_try --profile
 | `f0aedf0` | убрали checkpointing attention, сохраняем `gu` в MLP, единые чанки CE | 90.1 | 69.1 | 1.303x | 3119 | 4.599x | +0.010 % |
 | `cd1b98d` | `TritonLoRALinear4bitFn`, `silu_backward` на месте, плотные `repeat_kv`/SDPA, чанк CE 256 | 84.8 | 62.9 | 1.348x | 2779 | 5.162x | +0.005 % |
 | `26512f3` | сохранение `gu` без пересчета в MLP, оптимизация буферов SwiGLU backward | 79.1 | 58.4 | 1.355x | 2759 | 5.199x | +0.007 % |
+| `2be96d7` | финальный запуск в публичном Kaggle-ноутбуке (Save & Run All) | 84.6 | 62.5 | 1.352x | 2759 | 5.199x | +0.004 % |
 
 ### 3.3 Честно об ограничениях
 
