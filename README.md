@@ -67,7 +67,7 @@
 
 ## 2. Как запустить
 
-**Публичный ноутбук:** [ССЫЛКА НА НОУТБУК]  
+**Публичный ноутбук:** https://www.kaggle.com/code/lolkek4ik/notebook90b0a93b32  
 **Репозиторий:** https://github.com/adilhan385/soup-kernel-challenge  
 **Финальный коммит решения:** `26512f3` (ветка `main`).
 

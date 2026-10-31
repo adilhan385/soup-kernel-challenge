@@ -3,9 +3,9 @@
 - **Repository:** https://github.com/adilhan385/soup-kernel-challenge
 - **Final commit:** `26512f3` (or latest `main`)
 - **Measured solution code:** `26512f3`
-- **Public Kaggle notebook (Save & Run All):** [ССЫЛКА НА НОУТБУК]
-- **Demo video:** [УТОЧНИТЬ]
-- **Presentation:** [УТОЧНИТЬ]
+- **Public Kaggle notebook (Save & Run All):** https://www.kaggle.com/code/lolkek4ik/notebook90b0a93b32
+- **Demo video script / structure:** [VIDEO_SCRIPT.md](VIDEO_SCRIPT.md) (запись видео по сценарию)
+- **Presentation (4 slides):** [PRESENTATION.md](PRESENTATION.md)
 
 ## Measured results (Kaggle Tesla T4, `python harness/run_task.py`, 1 repeat)
 
