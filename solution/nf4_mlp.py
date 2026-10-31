@@ -60,14 +60,14 @@ def get_shared_scratch(
     Slot 0 is shared across non-overlapping operations:
       - ``TritonLinear4bitFn`` dequantized weight ([1536, 1536])
       - ``TritonCompactNF4MLPFn`` fused gate+up weight ([17920, 1536], 52.5 MiB)
-      - ``TritonChunkedHeadLossFn`` chunk logits ([128, 151936], 37.1 MiB)
+      - ``TritonChunkedHeadLossFn`` chunk logits ([512, 151936], 148.4 MiB)
     Slot 1 holds ``TritonCompactNF4MLPFn`` down weight ([1536, 8960], 26.25 MiB).
     """
     key = (device, dtype, slot)
     needed = shape[0] * shape[1]
     buf = _SCRATCH_POOL.get(key)
     if buf is None or buf.numel() < needed:
-        min_elems = 27525120 if slot == 0 else 13762560
+        min_elems = 77791232 if slot == 0 else 13762560
         buf = torch.empty((max(needed, min_elems),), dtype=dtype, device=device)
         _SCRATCH_POOL[key] = buf
     return buf[:needed].view(shape)
@@ -244,14 +244,30 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         dequantize_nf4_triton(w_down, dtype=compute_dtype, out=w_d)
 
         gu = torch.matmul(x_2d, w_gu.t())
-        g = gu[:, :inter_dim]
-        u = gu[:, inter_dim:]
-        F.silu(g, inplace=True)
-        g.mul_(u)
-        out_2d = torch.matmul(g, w_d.t())
-        del gu
+        save_gu = (
+            torch.is_grad_enabled()
+            and x.requires_grad
+            and ((not x.is_cuda) or (torch.cuda.memory_allocated(x.device) < 2600 * 1024 * 1024))
+        )
+        if save_gu:
+            h = F.silu(gu[:, :inter_dim]) * gu[:, inter_dim:]
+            out_2d = torch.matmul(h, w_d.t())
+            del h
+            ctx.save_for_backward(gu)
+            ctx.saved_gu = True
+        else:
+            g = gu[:, :inter_dim]
+            u = gu[:, inter_dim:]
+            F.silu(g, inplace=True)
+            g.mul_(u)
+            out_2d = torch.matmul(g, w_d.t())
+            del gu
+            ctx.save_for_backward(x_comp)
+            ctx.saved_gu = False
 
-        ctx.save_for_backward(x_comp)
+        ctx.orig_shape = orig_shape
+        ctx.rows = rows
+        ctx.hidden_dim = hidden_dim
         ctx.w_gate = w_gate
         ctx.w_up = w_up
         ctx.w_down = w_down
@@ -262,28 +278,31 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        (x_comp,) = ctx.saved_tensors
+        (saved,) = ctx.saved_tensors
         compute_dtype = ctx.compute_dtype
         dy_comp = (grad_out if grad_out.dtype == compute_dtype else grad_out.to(compute_dtype)).contiguous()
 
-        orig_shape = x_comp.shape
-        hidden_dim = orig_shape[-1]
-        rows = x_comp.numel() // hidden_dim
-        x_2d = x_comp.view(rows, hidden_dim)
+        orig_shape = ctx.orig_shape
+        rows = ctx.rows
+        hidden_dim = ctx.hidden_dim
         dy_2d = dy_comp.view(rows, hidden_dim)
 
         inter_dim = int(ctx.w_gate.quant_state.shape[0])
-        w_gu = get_shared_scratch(x_comp.device, compute_dtype, 0, (2 * inter_dim, hidden_dim))
-        w_d = get_shared_scratch(x_comp.device, compute_dtype, 1, (hidden_dim, inter_dim))
+        w_gu = get_shared_scratch(saved.device, compute_dtype, 0, (2 * inter_dim, hidden_dim))
+        w_d = get_shared_scratch(saved.device, compute_dtype, 1, (hidden_dim, inter_dim))
 
         dequantize_nf4_triton(ctx.w_gate, dtype=compute_dtype, out=w_gu[:inter_dim])
         dequantize_nf4_triton(ctx.w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
         dequantize_nf4_triton(ctx.w_down, dtype=compute_dtype, out=w_d)
 
-        gu = torch.matmul(x_2d, w_gu.t())
+        if ctx.saved_gu:
+            gu = saved
+        else:
+            x_2d = saved.view(rows, hidden_dim)
+            gu = torch.matmul(x_2d, w_gu.t())
         dh = torch.matmul(dy_2d, w_d)
 
-        step = 256
+        step = 1024
         for s in range(0, rows, step):
             e = min(s + step, rows)
             g_s = gu[s:e, :inter_dim].float()

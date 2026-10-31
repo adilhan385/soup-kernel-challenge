@@ -379,42 +379,7 @@ def patch_qwen2_rope():
         _unpadded_sdpa._soup_solution_patched = True
         F.scaled_dot_product_attention = _unpadded_sdpa
 
-    # 2. Selective attention sub-block checkpointing (frees 28 layers of Q/K/V/SDPA activations)
-    if not getattr(modeling_qwen2.Qwen2Attention.forward, "_soup_solution_patched", False):
-        orig_attn_fwd = modeling_qwen2.Qwen2Attention.forward
-
-        def _fast_qwen2_attn_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-            if (
-                self.training
-                and torch.is_grad_enabled()
-                and hidden_states.is_cuda
-                and hidden_states.requires_grad
-                and not kwargs.get("output_attentions", False)
-                and kwargs.get("past_key_value") is None
-                and kwargs.get("past_key_values") is None
-                and not kwargs.get("use_cache", False)
-            ):
-                captured_bounds = _UNPAD_STATE.bounds
-
-                def _run_attn(h):
-                    prev = _UNPAD_STATE.bounds
-                    _UNPAD_STATE.bounds = captured_bounds
-                    try:
-                        out, _ = orig_attn_fwd(self, h, *args, **kwargs)
-                        return out
-                    finally:
-                        _UNPAD_STATE.bounds = prev
-
-                attn_out = torch.utils.checkpoint.checkpoint(
-                    _run_attn, hidden_states, use_reentrant=True, preserve_rng_state=True
-                )
-                return attn_out, None
-            return orig_attn_fwd(self, hidden_states, *args, **kwargs)
-
-        _fast_qwen2_attn_forward._soup_solution_patched = True
-        modeling_qwen2.Qwen2Attention.forward = _fast_qwen2_attn_forward
-
-    # 3. Within-batch unpadding in Qwen2Model.forward (removes pad tokens inside each batch)
+    # 2. Within-batch unpadding in Qwen2Model.forward (removes pad tokens inside each batch)
     if not getattr(modeling_qwen2.Qwen2Model.forward, "_soup_solution_patched", False):
         orig_model_fwd = modeling_qwen2.Qwen2Model.forward
 

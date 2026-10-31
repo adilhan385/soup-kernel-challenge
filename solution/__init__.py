@@ -11,4 +11,4 @@ def apply():
     patch_qwen2_rmsnorm()
     patch_qwen2_rope()
     patch_nf4_and_qwen2_mlp()
-    patch_soup_chunked_ce(default_chunk=32)
+    patch_soup_chunked_ce(default_chunk=128)

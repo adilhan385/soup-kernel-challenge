@@ -165,12 +165,13 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
 
             active_idx = active_mask.nonzero(as_tuple=False).squeeze(-1)
             inactive_idx = inactive_valid_mask.nonzero(as_tuple=False).squeeze(-1)
-            chunk_rows = min(max(bsz * chunk, 64), 128)
-
-            # 1. Supervised tokens (active_idx): run both forward CE+entropy and backward dlogits @ W
             n_active = active_idx.numel()
-            for start in range(0, n_active, chunk_rows):
-                idx_slice = active_idx[start : start + chunk_rows]
+            all_valid_idx = torch.cat([active_idx, inactive_idx], dim=0)
+            n_total_valid = all_valid_idx.numel()
+            chunk_rows = min(max(bsz * chunk, 128), 512)
+
+            for start in range(0, n_total_valid, chunk_rows):
+                idx_slice = all_valid_idx[start : start + chunk_rows]
                 rows = idx_slice.numel()
                 piece_2d = hidden_flat.index_select(0, idx_slice)
                 labels_slice = target_flat.index_select(0, idx_slice)
@@ -199,59 +200,29 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
                     num_warps=8,
                 )
 
-                total = total + loss_1d.sum()
                 token_entropy_flat.index_copy_(0, idx_slice, ent_1d.to(hidden.dtype))
-                token_loss_flat.index_copy_(0, idx_slice, loss_1d)
-                correct = correct + hits_1d.sum()
+                bwd_rows = max(0, min(rows, n_active - start))
+                if bwd_rows > 0:
+                    active_slice = idx_slice[:bwd_rows]
+                    total = total + loss_1d[:bwd_rows].sum()
+                    token_loss_flat.index_copy_(0, active_slice, loss_1d[:bwd_rows])
+                    correct = correct + hits_1d[:bwd_rows].sum()
 
-                if with_grad:
-                    grid_bwd = (rows, triton.cdiv(vocab_size, block_v_bwd))
-                    qwen2_online_ce_bwd_kernel[grid_bwd](
-                        logits_2d,
-                        lse_1d,
-                        labels_slice,
-                        inv_denom,
-                        logits_2d.stride(0),
-                        vocab_size,
-                        int(ignore_index),
-                        BLOCK_V=block_v_bwd,
-                        num_warps=8,
-                    )
-                    grad_2d = torch.matmul(logits_2d, w_compute)
-                    grad_flat.index_copy_(0, idx_slice, grad_2d)
-
-            # 2. Prompt (non-pad, target == ignore_index) tokens: forward entropy only, zero gradient
-            n_inactive = inactive_idx.numel()
-            for start in range(0, n_inactive, chunk_rows):
-                idx_slice = inactive_idx[start : start + chunk_rows]
-                rows = idx_slice.numel()
-                piece_2d = hidden_flat.index_select(0, idx_slice)
-                labels_slice = target_flat.index_select(0, idx_slice)
-
-                logits_2d = get_shared_scratch(device, hidden.dtype, 0, (rows, vocab_size))
-                torch.matmul(piece_2d, w_compute.t(), out=logits_2d)
-                if head_bias is not None:
-                    logits_2d.add_(head_bias.to(hidden.dtype))
-
-                lse_1d = torch.empty((rows,), dtype=torch.float32, device=device)
-                ent_1d = torch.empty((rows,), dtype=torch.float32, device=device)
-                loss_1d = torch.empty((rows,), dtype=torch.float32, device=device)
-                hits_1d = torch.empty((rows,), dtype=torch.long, device=device)
-
-                qwen2_online_ce_entropy_fwd_kernel[(rows,)](
-                    logits_2d,
-                    labels_slice,
-                    lse_1d,
-                    ent_1d,
-                    loss_1d,
-                    hits_1d,
-                    logits_2d.stride(0),
-                    vocab_size,
-                    int(ignore_index),
-                    BLOCK_V=block_v_fwd,
-                    num_warps=8,
-                )
-                token_entropy_flat.index_copy_(0, idx_slice, ent_1d.to(hidden.dtype))
+                    if with_grad:
+                        grid_bwd = (bwd_rows, triton.cdiv(vocab_size, block_v_bwd))
+                        qwen2_online_ce_bwd_kernel[grid_bwd](
+                            logits_2d[:bwd_rows],
+                            lse_1d[:bwd_rows],
+                            labels_slice[:bwd_rows],
+                            inv_denom,
+                            logits_2d.stride(0),
+                            vocab_size,
+                            int(ignore_index),
+                            BLOCK_V=block_v_bwd,
+                            num_warps=8,
+                        )
+                        grad_2d = torch.matmul(logits_2d[:bwd_rows], w_compute)
+                        grad_flat.index_copy_(0, active_slice, grad_2d)
 
             token_entropy = token_entropy_flat.view(bsz, seq_len)
             token_loss = token_loss_flat.view(bsz, seq_len)
@@ -332,7 +303,7 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
         return (grad * grad_loss.to(grad.dtype), None, None, None, None, None, None)
 
 
-def patch_soup_chunked_ce(default_chunk: int = 32):
+def patch_soup_chunked_ce(default_chunk: int = 128):
     """Patch Soup's stream_loss_chunk to use TritonChunkedHeadLossFn and avoid fp32 embedding spikes."""
     import soup_cli.utils.stream_loss_chunk as slc
     from soup_cli.trainer import sft as sft_mod
