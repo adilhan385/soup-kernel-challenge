@@ -1,6 +1,8 @@
-"""Fused QK Rotary Position Embedding (RoPE) in Triton for Qwen2."""
+"""Fused QK Rotary Position Embedding (RoPE) in Triton + within-batch unpadding & attention checkpointing."""
 
 import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
 import triton
 import triton.language as tl
 
@@ -265,7 +267,263 @@ def fused_apply_rotary_pos_emb(
     return (q * cos_u) + (q_rot * sin_u), (k * cos_u) + (k_rot * sin_u)
 
 
+class _UnpadState:
+    bounds: tuple[int, tuple[tuple[int, int], ...]] | None = None
+    last_unpad_info: tuple[int, tuple[int, ...], torch.Tensor] | None = None
+
+
+_UNPAD_STATE = _UnpadState()
+
+
+def pop_unpad_valid_mask(hidden: torch.Tensor) -> torch.Tensor | None:
+    """Return and clear the flat boolean valid-token mask if ``hidden`` matches the last unpadded output."""
+    info = _UNPAD_STATE.last_unpad_info
+    _UNPAD_STATE.last_unpad_info = None
+    if info is not None and hidden.data_ptr() == info[0] and tuple(hidden.shape) == info[1]:
+        return info[2]
+    return None
+
+
+class _ScatterUnpaddedFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        unpad_hidden: torch.Tensor,
+        valid_idx: torch.Tensor,
+        valid_mask_flat: torch.Tensor,
+        bsz: int,
+        seq_len: int,
+    ):
+        hidden_dim = unpad_hidden.shape[-1]
+        out = torch.zeros(
+            (bsz * seq_len, hidden_dim), dtype=unpad_hidden.dtype, device=unpad_hidden.device
+        )
+        out.index_copy_(0, valid_idx, unpad_hidden.squeeze(0))
+        out_3d = out.view(bsz, seq_len, hidden_dim)
+        _UNPAD_STATE.last_unpad_info = (out_3d.data_ptr(), tuple(out_3d.shape), valid_mask_flat)
+        ctx.save_for_backward(valid_idx)
+        return out_3d
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (valid_idx,) = ctx.saved_tensors
+        hidden_dim = grad_out.shape[-1]
+        grad_flat = grad_out.reshape(-1, hidden_dim)
+        grad_unpad = grad_flat.index_select(0, valid_idx).unsqueeze(0)
+        return grad_unpad, None, None, None, None
+
+
 def patch_qwen2_rope():
     from transformers.models.qwen2 import modeling_qwen2
 
     modeling_qwen2.apply_rotary_pos_emb = fused_apply_rotary_pos_emb
+
+    # 1. Per-sequence causal SDPA when within-batch unpadding is active
+    if not getattr(F.scaled_dot_product_attention, "_soup_solution_patched", False):
+        orig_sdpa = F.scaled_dot_product_attention
+
+        def _unpadded_sdpa(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=None,
+            **kwargs,
+        ):
+            bounds_info = _UNPAD_STATE.bounds
+            if (
+                bounds_info is not None
+                and query.is_cuda
+                and query.shape[0] == 1
+                and query.shape[2] == bounds_info[0]
+            ):
+                _, seq_bounds = bounds_info
+                if len(seq_bounds) == 1:
+                    return orig_sdpa(
+                        query,
+                        key,
+                        value,
+                        attn_mask=None,
+                        dropout_p=dropout_p,
+                        is_causal=True,
+                        scale=scale,
+                        **kwargs,
+                    )
+                outs = [
+                    orig_sdpa(
+                        query[:, :, s:e, :],
+                        key[:, :, s:e, :],
+                        value[:, :, s:e, :],
+                        attn_mask=None,
+                        dropout_p=dropout_p,
+                        is_causal=True,
+                        scale=scale,
+                        **kwargs,
+                    )
+                    for s, e in seq_bounds
+                ]
+                return torch.cat(outs, dim=2)
+            return orig_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                **kwargs,
+            )
+
+        _unpadded_sdpa._soup_solution_patched = True
+        F.scaled_dot_product_attention = _unpadded_sdpa
+
+    # 2. Selective attention sub-block checkpointing (frees 28 layers of Q/K/V/SDPA activations)
+    if not getattr(modeling_qwen2.Qwen2Attention.forward, "_soup_solution_patched", False):
+        orig_attn_fwd = modeling_qwen2.Qwen2Attention.forward
+
+        def _fast_qwen2_attn_forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+            if (
+                self.training
+                and torch.is_grad_enabled()
+                and hidden_states.is_cuda
+                and hidden_states.requires_grad
+                and not kwargs.get("output_attentions", False)
+                and kwargs.get("past_key_value") is None
+                and kwargs.get("past_key_values") is None
+                and not kwargs.get("use_cache", False)
+            ):
+                captured_bounds = _UNPAD_STATE.bounds
+
+                def _run_attn(h):
+                    prev = _UNPAD_STATE.bounds
+                    _UNPAD_STATE.bounds = captured_bounds
+                    try:
+                        out, _ = orig_attn_fwd(self, h, *args, **kwargs)
+                        return out
+                    finally:
+                        _UNPAD_STATE.bounds = prev
+
+                attn_out = torch.utils.checkpoint.checkpoint(
+                    _run_attn, hidden_states, use_reentrant=True, preserve_rng_state=True
+                )
+                return attn_out, None
+            return orig_attn_fwd(self, hidden_states, *args, **kwargs)
+
+        _fast_qwen2_attn_forward._soup_solution_patched = True
+        modeling_qwen2.Qwen2Attention.forward = _fast_qwen2_attn_forward
+
+    # 3. Within-batch unpadding in Qwen2Model.forward (removes pad tokens inside each batch)
+    if not getattr(modeling_qwen2.Qwen2Model.forward, "_soup_solution_patched", False):
+        orig_model_fwd = modeling_qwen2.Qwen2Model.forward
+
+        def _fast_qwen2_model_forward(
+            self,
+            input_ids: torch.LongTensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.LongTensor | None = None,
+            past_key_values=None,
+            inputs_embeds: torch.FloatTensor | None = None,
+            use_cache: bool | None = None,
+            output_attentions: bool | None = None,
+            output_hidden_states: bool | None = None,
+            return_dict: bool | None = None,
+            cache_position: torch.LongTensor | None = None,
+            **kwargs,
+        ):
+            effective_use_cache = (
+                use_cache if use_cache is not None else getattr(self.config, "use_cache", False)
+            )
+            if self.training:
+                effective_use_cache = False
+            if (
+                not getattr(self, "gradient_checkpointing", False)
+                and input_ids is not None
+                and input_ids.is_cuda
+                and input_ids.dim() == 2
+                and inputs_embeds is None
+                and attention_mask is not None
+                and attention_mask.dim() == 2
+                and attention_mask.shape == input_ids.shape
+                and position_ids is None
+                and past_key_values is None
+                and not effective_use_cache
+                and not output_attentions
+                and not output_hidden_states
+            ):
+                bsz, seq_len = input_ids.shape
+                if bsz > 1:
+                    mask_bool = attention_mask.ne(0)
+                    lengths = mask_bool.sum(dim=1).tolist()
+                    total_valid = sum(lengths)
+                    if 0 < total_valid < bsz * seq_len and all(
+                        length > 0 for length in lengths
+                    ):
+                        valid_mask_flat = mask_bool.reshape(-1)
+                        valid_idx = valid_mask_flat.nonzero(as_tuple=False).squeeze(-1)
+                        pos_full = (mask_bool.cumsum(dim=1) - 1).clamp(min=0)
+                        unpad_input_ids = (
+                            input_ids.reshape(-1).index_select(0, valid_idx).unsqueeze(0)
+                        )
+                        unpad_pos_ids = (
+                            pos_full.reshape(-1).index_select(0, valid_idx).unsqueeze(0)
+                        )
+
+                        bounds = []
+                        offset = 0
+                        for length in lengths:
+                            bounds.append((offset, offset + length))
+                            offset += length
+
+                        prev_bounds = _UNPAD_STATE.bounds
+                        _UNPAD_STATE.bounds = (total_valid, tuple(bounds))
+                        try:
+                            outputs = orig_model_fwd(
+                                self,
+                                input_ids=unpad_input_ids,
+                                attention_mask=None,
+                                position_ids=unpad_pos_ids,
+                                past_key_values=None,
+                                inputs_embeds=None,
+                                use_cache=False,
+                                output_attentions=output_attentions,
+                                output_hidden_states=output_hidden_states,
+                                return_dict=return_dict,
+                                cache_position=None,
+                                **kwargs,
+                            )
+                        finally:
+                            _UNPAD_STATE.bounds = prev_bounds
+
+                        if isinstance(outputs, tuple):
+                            unpad_hidden = outputs[0]
+                            padded_hidden = _ScatterUnpaddedFn.apply(
+                                unpad_hidden, valid_idx, valid_mask_flat, bsz, seq_len
+                            )
+                            return (padded_hidden,) + outputs[1:]
+
+                        unpad_hidden = outputs.last_hidden_state
+                        padded_hidden = _ScatterUnpaddedFn.apply(
+                            unpad_hidden, valid_idx, valid_mask_flat, bsz, seq_len
+                        )
+                        outputs.last_hidden_state = padded_hidden
+                        return outputs
+
+            return orig_model_fwd(
+                self,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        _fast_qwen2_model_forward._soup_solution_patched = True
+        modeling_qwen2.Qwen2Model.forward = _fast_qwen2_model_forward

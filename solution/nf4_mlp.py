@@ -49,54 +49,114 @@ def qwen2_nf4_dequant_kernel(
     tl.store(out_ptr + offs, deq.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-_WEIGHT_SCRATCH = {}
+_SCRATCH_POOL = {}
 
 
-def _get_weight_scratch(device: torch.device, dtype: torch.dtype, tag: str, shape: tuple[int, int]) -> torch.Tensor:
-    key = (device, dtype, tag, shape)
-    buf = _WEIGHT_SCRATCH.get(key)
-    if buf is None:
-        buf = torch.empty(shape, dtype=dtype, device=device)
-        _WEIGHT_SCRATCH[key] = buf
-    return buf
+def get_shared_scratch(
+    device: torch.device, dtype: torch.dtype, slot: int, shape: tuple[int, int]
+) -> torch.Tensor:
+    """Return a 2D view into a persistent scratch buffer for the given slot.
+
+    Slot 0 is shared across non-overlapping operations:
+      - ``TritonLinear4bitFn`` dequantized weight ([1536, 1536])
+      - ``TritonCompactNF4MLPFn`` fused gate+up weight ([17920, 1536], 52.5 MiB)
+      - ``TritonChunkedHeadLossFn`` chunk logits ([128, 151936], 37.1 MiB)
+    Slot 1 holds ``TritonCompactNF4MLPFn`` down weight ([1536, 8960], 26.25 MiB).
+    """
+    key = (device, dtype, slot)
+    needed = shape[0] * shape[1]
+    buf = _SCRATCH_POOL.get(key)
+    if buf is None or buf.numel() < needed:
+        min_elems = 27525120 if slot == 0 else 13762560
+        buf = torch.empty((max(needed, min_elems),), dtype=dtype, device=device)
+        _SCRATCH_POOL[key] = buf
+    return buf[:needed].view(shape)
 
 
 def clear_weight_scratch():
-    _WEIGHT_SCRATCH.clear()
+    _SCRATCH_POOL.clear()
 
 
-def dequantize_nf4_triton(weight, dtype: torch.dtype = torch.float16, out: torch.Tensor | None = None) -> torch.Tensor:
+def dequantize_nf4_triton(
+    weight, dtype: torch.dtype = torch.float16, out: torch.Tensor | None = None
+) -> torch.Tensor:
     """Dequantize a bitsandbytes Params4bit weight tensor into ``dtype`` using ``qwen2_nf4_dequant_kernel``."""
-    qs = weight.quant_state
-    shape = tuple(qs.shape) if hasattr(qs, "shape") else tuple(weight.shape)
-    n_elements = shape[0] * shape[1]
+    meta = getattr(weight, "_soup_nf4_meta", None)
+    if (
+        meta is None
+        or meta[0].device != weight.device
+        or meta[0].data_ptr() != weight.data.data_ptr()
+    ):
+        qs = weight.quant_state
+        shape = tuple(qs.shape) if hasattr(qs, "shape") else tuple(weight.shape)
+        n_elements = shape[0] * shape[1]
+        packed = weight.data.view(-1)
+        blocksize = int(qs.blocksize)
+        is_nested = bool(getattr(qs, "nested", False))
+
+        if is_nested:
+            s2 = qs.state2
+            s2_code = s2.code
+            s2_absmax = s2.absmax
+            s2_blocksize = int(s2.blocksize)
+            offset_val = (
+                float(qs.offset.item())
+                if torch.is_tensor(qs.offset)
+                else float(qs.offset or 0.0)
+            )
+        else:
+            s2_code = qs.code
+            s2_absmax = qs.absmax
+            s2_blocksize = 256
+            offset_val = 0.0
+
+        block_elems = 1024
+        grid = (triton.cdiv(n_elements, block_elems),)
+        meta = (
+            packed,
+            qs.code,
+            qs.absmax,
+            s2_code,
+            s2_absmax,
+            offset_val,
+            n_elements,
+            blocksize,
+            s2_blocksize,
+            is_nested,
+            shape,
+            block_elems,
+            grid,
+        )
+        try:
+            weight._soup_nf4_meta = meta
+        except Exception:
+            pass
+
+    (
+        packed,
+        code,
+        absmax,
+        s2_code,
+        s2_absmax,
+        offset_val,
+        n_elements,
+        blocksize,
+        s2_blocksize,
+        is_nested,
+        shape,
+        block_elems,
+        grid,
+    ) = meta
+
     if out is None:
         out = torch.empty(shape, dtype=dtype, device=weight.device)
     else:
         out = out.view(shape)
 
-    packed = weight.data.view(-1)
-    blocksize = int(qs.blocksize)
-    is_nested = bool(getattr(qs, "nested", False))
-
-    if is_nested:
-        s2 = qs.state2
-        s2_code = s2.code
-        s2_absmax = s2.absmax
-        s2_blocksize = int(s2.blocksize)
-        offset_val = float(qs.offset.item()) if torch.is_tensor(qs.offset) else float(qs.offset or 0.0)
-    else:
-        s2_code = qs.code
-        s2_absmax = qs.absmax
-        s2_blocksize = 256
-        offset_val = 0.0
-
-    block_elems = 1024
-    grid = (triton.cdiv(n_elements, block_elems),)
     qwen2_nf4_dequant_kernel[grid](
         packed,
-        qs.code,
-        qs.absmax,
+        code,
+        absmax,
         s2_code,
         s2_absmax,
         out,
@@ -124,14 +184,13 @@ class TritonLinear4bitFn(torch.autograd.Function):
         compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float16
         x_comp = x if x.dtype == compute_dtype else x.to(compute_dtype)
 
-        qs = weight.quant_state
-        w_shape = tuple(qs.shape)
-        w_buf = _get_weight_scratch(x.device, compute_dtype, "linear", w_shape)
+        w_shape = tuple(weight.quant_state.shape)
+        w_buf = get_shared_scratch(x.device, compute_dtype, 0, w_shape)
         dequantize_nf4_triton(weight, dtype=compute_dtype, out=w_buf)
 
         out = torch.matmul(x_comp, w_buf.t())
         if bias is not None:
-            out = out + (bias if bias.dtype == compute_dtype else bias.to(compute_dtype))
+            out.add_(bias if bias.dtype == compute_dtype else bias.to(compute_dtype))
 
         ctx.weight = weight
         ctx.input_dtype = x.dtype
@@ -146,7 +205,7 @@ class TritonLinear4bitFn(torch.autograd.Function):
 
         weight = ctx.weight
         w_shape = tuple(weight.quant_state.shape)
-        w_buf = _get_weight_scratch(dy.device, compute_dtype, "linear", w_shape)
+        w_buf = get_shared_scratch(dy.device, compute_dtype, 0, w_shape)
         dequantize_nf4_triton(weight, dtype=compute_dtype, out=w_buf)
 
         grad_x = torch.matmul(dy, w_buf)
@@ -162,9 +221,8 @@ class TritonLinear4bitFn(torch.autograd.Function):
 class TritonCompactNF4MLPFn(torch.autograd.Function):
     """Memory-saving Qwen2MLP autograd function for frozen 4-bit gate/up/down projections.
 
-    Saves only the compact MLP input ``x`` ([B, S, H], 6 MB/layer) instead of
-    four intermediate [B, S, 8960] tensors (~147 MB/layer in fp16 or ~294 MB/layer in fp32),
-    and fuses gate+up GEMMs in both forward and backward passes.
+    Saves only the compact MLP input ``x`` ([1, N_valid, H], ~2.6 MiB/layer) instead of
+    four intermediate [B, S, 8960] tensors, and fuses gate+up GEMMs in both forward and backward.
     """
 
     @staticmethod
@@ -178,8 +236,8 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         x_2d = x_comp.view(rows, hidden_dim)
 
         inter_dim = int(w_gate.quant_state.shape[0])
-        w_gu = _get_weight_scratch(x.device, compute_dtype, "mlp_gu", (2 * inter_dim, hidden_dim))
-        w_d = _get_weight_scratch(x.device, compute_dtype, "mlp_d", (hidden_dim, inter_dim))
+        w_gu = get_shared_scratch(x.device, compute_dtype, 0, (2 * inter_dim, hidden_dim))
+        w_d = get_shared_scratch(x.device, compute_dtype, 1, (hidden_dim, inter_dim))
 
         dequantize_nf4_triton(w_gate, dtype=compute_dtype, out=w_gu[:inter_dim])
         dequantize_nf4_triton(w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
@@ -188,8 +246,10 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         gu = torch.matmul(x_2d, w_gu.t())
         g = gu[:, :inter_dim]
         u = gu[:, inter_dim:]
-        h = F.silu(g) * u
-        out_2d = torch.matmul(h, w_d.t())
+        F.silu(g, inplace=True)
+        g.mul_(u)
+        out_2d = torch.matmul(g, w_d.t())
+        del gu
 
         ctx.save_for_backward(x_comp)
         ctx.w_gate = w_gate
@@ -213,8 +273,8 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         dy_2d = dy_comp.view(rows, hidden_dim)
 
         inter_dim = int(ctx.w_gate.quant_state.shape[0])
-        w_gu = _get_weight_scratch(x_comp.device, compute_dtype, "mlp_gu", (2 * inter_dim, hidden_dim))
-        w_d = _get_weight_scratch(x_comp.device, compute_dtype, "mlp_d", (hidden_dim, inter_dim))
+        w_gu = get_shared_scratch(x_comp.device, compute_dtype, 0, (2 * inter_dim, hidden_dim))
+        w_d = get_shared_scratch(x_comp.device, compute_dtype, 1, (hidden_dim, inter_dim))
 
         dequantize_nf4_triton(ctx.w_gate, dtype=compute_dtype, out=w_gu[:inter_dim])
         dequantize_nf4_triton(ctx.w_up, dtype=compute_dtype, out=w_gu[inter_dim:])
@@ -223,17 +283,21 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         gu = torch.matmul(x_2d, w_gu.t())
         dh = torch.matmul(dy_2d, w_d)
 
-        g_f = gu[:, :inter_dim].float()
-        u = gu[:, inter_dim:]
-        sig = torch.sigmoid(g_f)
-        silu_g = (g_f * sig).to(compute_dtype)
-        grad_silu = (sig * (1.0 + g_f * (1.0 - sig))).to(compute_dtype)
-
-        dg = dh * u * grad_silu
-        du = dh * silu_g
-        gu[:, :inter_dim] = dg
-        gu[:, inter_dim:] = du
+        step = 256
+        for s in range(0, rows, step):
+            e = min(s + step, rows)
+            g_s = gu[s:e, :inter_dim].float()
+            u_s = gu[s:e, inter_dim:].float()
+            dh_s = dh[s:e].float()
+            sig = torch.sigmoid(g_s)
+            silu_g = g_s * sig
+            du_s = dh_s * silu_g
+            dg_s = dh_s * u_s * (sig + silu_g * (1.0 - sig))
+            gu[s:e, :inter_dim] = dg_s.to(compute_dtype)
+            gu[s:e, inter_dim:] = du_s.to(compute_dtype)
+        del dh
         dx_2d = torch.matmul(gu, w_gu)
+        del gu
 
         dx = dx_2d.view(orig_shape)
         if dx.dtype != ctx.input_dtype:
