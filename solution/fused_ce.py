@@ -168,7 +168,7 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
             n_active = active_idx.numel()
             all_valid_idx = torch.cat([active_idx, inactive_idx], dim=0)
             n_total_valid = all_valid_idx.numel()
-            chunk_rows = min(max(bsz * chunk, 128), 512)
+            chunk_rows = min(max(bsz * chunk, 128), 256)
 
             for start in range(0, n_total_valid, chunk_rows):
                 idx_slice = all_valid_idx[start : start + chunk_rows]
@@ -303,7 +303,7 @@ class TritonChunkedHeadLossFn(torch.autograd.Function):
         return (grad * grad_loss.to(grad.dtype), None, None, None, None, None, None)
 
 
-def patch_soup_chunked_ce(default_chunk: int = 128):
+def patch_soup_chunked_ce(default_chunk: int = 64):
     """Patch Soup's stream_loss_chunk to use TritonChunkedHeadLossFn and avoid fp32 embedding spikes."""
     import soup_cli.utils.stream_loss_chunk as slc
     from soup_cli.trainer import sft as sft_mod

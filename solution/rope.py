@@ -313,10 +313,24 @@ class _ScatterUnpaddedFn(torch.autograd.Function):
         return grad_unpad, None, None, None, None
 
 
+def fast_repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat KV heads while keeping physical memory in [B, S, H, D] order so sequence slices [:, :, s:e, :] are dense."""
+    if n_rep == 1:
+        return hidden_states
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    return (
+        hidden_states.transpose(1, 2)[:, :, :, None, :]
+        .expand(batch, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
+        .transpose(1, 2)
+    )
+
+
 def patch_qwen2_rope():
     from transformers.models.qwen2 import modeling_qwen2
 
     modeling_qwen2.apply_rotary_pos_emb = fused_apply_rotary_pos_emb
+    modeling_qwen2.repeat_kv = fast_repeat_kv
 
     # 1. Per-sequence causal SDPA when within-batch unpadding is active
     if not getattr(F.scaled_dot_product_attention, "_soup_solution_patched", False):
@@ -361,10 +375,10 @@ def patch_qwen2_rope():
                         is_causal=True,
                         scale=scale,
                         **kwargs,
-                    )
+                    ).transpose(1, 2)
                     for s, e in seq_bounds
                 ]
-                return torch.cat(outs, dim=2)
+                return torch.cat(outs, dim=1).transpose(1, 2)
             return orig_sdpa(
                 query,
                 key,
