@@ -362,7 +362,7 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         save_gu = (
             torch.is_grad_enabled()
             and x.requires_grad
-            and ((not x.is_cuda) or (torch.cuda.memory_allocated(x.device) < 2400 * 1024 * 1024))
+            and ((not x.is_cuda) or (torch.cuda.memory_allocated(x.device) < 4096 * 1024 * 1024))
         )
         if save_gu:
             h = F.silu(gu[:, :inter_dim])
@@ -420,14 +420,15 @@ class TritonCompactNF4MLPFn(torch.autograd.Function):
         dh = torch.matmul(dy_2d, w_d)
         g = gu[:, :inter_dim]
         u = gu[:, inter_dim:]
+        u.mul_(dh)  # u <- dL/dsilu(g)
         silu_g = F.silu(g)
-        u.mul_(dh)
+        dh.mul_(silu_g)  # dh <- dL/du
+        del silu_g
         dg = torch.ops.aten.silu_backward(u, g)
         g.copy_(dg)
         del dg
-        silu_g.mul_(dh)
-        u.copy_(silu_g)
-        del silu_g, dh, saved
+        u.copy_(dh)
+        del dh, saved
 
         if ctx.saved_gu:
             dequantize_nf4_triton(ctx.w_gate, dtype=compute_dtype, out=w_gu[:inter_dim])
