@@ -1,8 +1,7 @@
-"""Fused QK Rotary Position Embedding (RoPE) in Triton + within-batch unpadding & attention checkpointing."""
+"""Fused QK Rotary Position Embedding (RoPE) in Triton + within-batch unpadding (per-sequence causal SDPA)."""
 
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
 import triton
 import triton.language as tl
 

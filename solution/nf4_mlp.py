@@ -477,7 +477,7 @@ def patch_nf4_and_qwen2_mlp():
 
         orig_lora_4bit_fwd = lora_bnb.Linear4bit.forward
 
-        def _fast_lora_4bit_forward(self, x: torch.Tensor, *args, **kwargs):
+        def _triton_lora_4bit_forward(self, x: torch.Tensor, *args, **kwargs):
             if (
                 not args
                 and not kwargs
@@ -512,8 +512,8 @@ def patch_nf4_and_qwen2_mlp():
             return orig_lora_4bit_fwd(self, x, *args, **kwargs)
 
         if not getattr(lora_bnb.Linear4bit.forward, "_soup_solution_patched", False):
-            _fast_lora_4bit_forward._soup_solution_patched = True
-            lora_bnb.Linear4bit.forward = _fast_lora_4bit_forward
+            _triton_lora_4bit_forward._soup_solution_patched = True
+            lora_bnb.Linear4bit.forward = _triton_lora_4bit_forward
     except Exception:
         pass
 
